@@ -1,8 +1,8 @@
-name: repro
+name: om4labs
 channels:
   - conda-forge
 dependencies:
-  - python=3.8
+  - python
   - black
   - cartopy
   - dask
@@ -26,5 +26,5 @@ dependencies:
   - shapely
   - six
   - xarray
-  - xesmf
+  - xesmf=0.4.0
   - xgcm
