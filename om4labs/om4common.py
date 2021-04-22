@@ -1,18 +1,28 @@
 # need a data_read, data_sel, data_reduce
 
-import numpy as np
 import argparse
-import intake
+import calendar
+import glob
 import io
+import os
+import pathlib
 import signal
 import sys
-import matplotlib.pyplot as plt
-import pkg_resources as pkgr
 import tarfile as tf
-import xarray as xr
 import warnings
+from datetime import datetime
 
+import intake
+import matplotlib
+import matplotlib.pyplot as plt
+import numpy as np
+import pkg_resources as pkgr
+import scipy
+import xarray as xr
+import xesmf as xe
 from cmip_basins import generate_basin_codes
+from packaging import version
+from xgcm import Grid
 
 try:
     from om4labs.helpers import try_variable_from_list
@@ -21,8 +31,11 @@ except ImportError:
     # reads from current directory
     from helpers import try_variable_from_list
 
-from static_downsampler.static import sum_on_supergrid
-from static_downsampler.static import subsample_supergrid
+from static_downsampler.static import (
+    extend_supergrid_array,
+    subsample_supergrid,
+    sum_on_supergrid,
+)
 
 possible_names = {}
 possible_names["lon"] = ["lon", "LON", "longitude", "LONGITUDE"]
@@ -43,7 +56,7 @@ class DefaultDictParser(argparse.ArgumentParser):
         return defaults
 
 
-def date_range(ds):
+def date_range(ds, ref_time="1970-01-01T00:00:00Z"):
     """Returns a tuple of start year and end year from xarray dataset
 
     Parameters
@@ -58,17 +71,74 @@ def date_range(ds):
     """
 
     if "time_bnds" in list(ds.variables):
-        t0 = tuple(ds["time_bnds"].values[0][0].timetuple())[0]
 
-        # if end bound is Jan-1, fall back to previous year
-        t1 = tuple(ds["time_bnds"].values[-1][-1].timetuple())
-        t1 = (t1[0] - 1) if (t1[1:3] == (1, 1)) else t1[0]
+        # Xarray decodes bounds times relative to the epoch and
+        # returns a numpy timedelta object in some instances
+        # instead of a cftime datetime object. Manual decoding
+        # and shifting may be necessary
+
+        if isinstance(ds["time_bnds"].values[0][0], np.timedelta64):
+            base_time = ds["time"].encoding["units"]
+            base_time = base_time.split(" ")[2:4]
+            base_time = np.datetime64(f"{base_time[0]}T{base_time[1]}Z")
+            offset = base_time - np.datetime64(ref_time)
+
+            t0 = ds["time_bnds"].values[0][0] + offset
+            t0 = datetime.fromtimestamp(int(np.ceil(int(t0) * 1.0e-9)))
+            t0 = tuple(t0.timetuple())
+            # if start bound is Dec-31, advance to next year
+            t0 = (t0[0] + 1) if (t0[1:3] == (12, 31)) else t0[0]
+
+            t1 = ds["time_bnds"].values[-1][-1] + offset
+            t1 = datetime.fromtimestamp(int(np.ceil(int(t1) * 1.0e-9)))
+            t1 = tuple(t1.timetuple())
+            # if end bound is Jan-1, fall back to previous year
+            t1 = (t1[0] - 1) if (t1[1:3] == (1, 1)) else t1[0]
+
+        else:
+            t0 = tuple(ds["time_bnds"].values[0][0].timetuple())[0]
+
+            # if end bound is Jan-1, fall back to previous year
+            t1 = tuple(ds["time_bnds"].values[-1][-1].timetuple())
+            t1 = (t1[0] - 1) if (t1[1:3] == (1, 1)) else t1[0]
 
     else:
         t0 = int(ds["time"].isel({"time": 0}).dt.strftime("%Y"))
         t1 = int(ds["time"].isel({"time": -1}).dt.strftime("%Y"))
 
     return (t0, t1)
+
+
+def discover_ts_dir(path, default="ts/monthly"):
+    """Find the directory with the longest timeseries chunk
+
+    Parameters
+    ----------
+    path : str, path-like
+        Path to top-level (.../pp) post-processing directory
+    default : str, optional
+        Time resolution to scan, by default "ts/monthly"
+
+    Returns
+    -------
+    str, path-like
+        Full path to timeseries directory with the longest chunks
+    """
+
+    # combine root pp path with the default chunk
+    path = f"{path}/{default}"
+    path = fixdir(path)
+
+    # get a list of subdirectories
+    subdirs = [f.path for f in os.scandir(path) if f.is_dir()]
+    subdirs = [dirname.replace(f"{path}/", "") for dirname in subdirs]
+
+    # chomp the last part of the path to obtain the numerical chunk length
+    subdirs = [int(dirname.replace("yr", "")) for dirname in subdirs]
+
+    # reconstruct and return the path
+    return_path = f"{path}/{max(subdirs)}yr/"
+    return fixdir(return_path)
 
 
 def extract_from_tar(tar, member):
@@ -100,11 +170,84 @@ def extract_from_tar(tar, member):
     return dataset
 
 
+def fixdir(path):
+    """Ensures a path string does not contain a double-slash
+
+    Parameters
+    ----------
+    path : str, path-like
+        string containing a path
+
+    Returns
+    -------
+    string with double slashes removed
+
+    """
+    return path.replace("//", "/")
+
+
+def generate_basin_masks(basin_code, basin=None):
+    """Returns 2-D array mask (1s/0s) for common pre-defined
+    basins and regions.
+
+    Parameters
+    ----------
+    basin_code : numpy.ndarray
+        2-dimensional array of CMIP-convention basin codes
+    basin : str or int, optional
+        Name of basin to calculate. Options are "atlantic_arctic"
+        and "indo_pacific". An integer basin code may also be 
+        passed. By default None
+
+    Returns
+    -------
+    numpy.ndarray
+        Basin mask of 1s and 0s.
+    """
+    mask = basin_code * 0
+    if basin == "atlantic_arctic":
+        mask[
+            (basin_code == 2)
+            | (basin_code == 4)
+            | (basin_code == 6)
+            | (basin_code == 7)
+            | (basin_code == 8)
+        ] = 1.0
+    elif basin == "indo_pacific":
+        mask[(basin_code == 3) | (basin_code == 5)] = 1.0
+    elif isinstance(basin, int):
+        mask[(basin_code == basin)] = 1.0
+    else:
+        mask[(basin_code >= 1)] = 1.0
+    return mask
+
+
 def image_handler(figs, dictArgs, filename="./figure"):
-    """Generic routine for image handling"""
+    """ Generic OM4Labs image handler. Depending on the framework mode,
+    this handler either saves a matplotlib figure handle to disk or
+    returns an in-memory image buffer
+
+    Parameters
+    ----------
+    figs : matplotlib.Figure or list
+        Matplotlib figure handle or list of figure handles
+    dictArgs : dict
+        Dictionary of parsed command-line options
+    filename : str, optional
+        Figure filename, by default "./figure"
+
+    Returns
+    -------
+    io.BytesIO
+        In-memory image buffers
+    """
 
     imgbufs = []
     numfigs = len(figs)
+
+    # test if output directory exists
+    if dictArgs["outdir"] != "./":
+        pathlib.Path(dictArgs["outdir"]).mkdir(parents=True, exist_ok=True)
 
     if not isinstance(filename, list):
         filename = [filename]
@@ -114,17 +257,8 @@ def image_handler(figs, dictArgs, filename="./figure"):
     ), "Number of figure handles and file names do not match."
 
     if dictArgs["interactive"] is True:
-        plt.ion()
-        for n, fig in enumerate(figs):
-            plt.show(fig)
+        plt.show()
 
-        def _signal_handler(sig, frame):
-            print("Complete!")
-            sys.exit(0)
-
-        signal.signal(signal.SIGINT, _signal_handler)
-        print("Press ctrl+c to exit...")
-        signal.pause()
     else:
         for n, fig in enumerate(figs):
             if dictArgs["format"] == "stream":
@@ -242,7 +376,42 @@ def compute_area_regular_grid(ds, Rearth=6378e3):
     return area
 
 
-def grid_from_supergrid(ds, point_type="t"):
+def is_symmetric(dset, x_center="xh", x_corner="xq", y_center="yh", y_corner="yq"):
+    """Determines if ocean model output is on a symmetric grid
+
+    Parameters
+    ----------
+    dset : [type]
+        [description]
+    x_center : str, optional
+        Name of x-cell centers dimension, by default "yxh"
+    x_corner : str, optional
+        Name of x-cell corners dimension, by default "xq"
+    y_center : str, optional
+        Name of y-cell centers dimension, by default "yh"
+    y_corner : str, optional
+        Name of y-cell corners dimension, by default "yq"
+
+    Returns
+    -------
+    bool
+        True if grid is symmetric
+    """
+
+    if (len(dset[x_corner]) == len(dset[x_center])) and (
+        len(dset[y_corner]) == len(dset[y_center])
+    ):
+        out = False
+    elif (len(dset[x_corner]) == len(dset[x_center]) + 1) and (
+        len(dset[y_corner]) == len(dset[y_center]) + 1
+    ):
+        out = True
+    else:
+        raise ValueError("unsupported combination of coordinates")
+    return out
+
+
+def grid_from_supergrid(ds, point_type="t", outputgrid="nonsymetric"):
     """Subsample super grid to obtain geolon, geolat, and cell area
 
     Parameters
@@ -251,6 +420,8 @@ def grid_from_supergrid(ds, point_type="t"):
         Input dataset containing variables from the supergrid
     point_type : str, optional
         Requested grid type of t|q|u|v, by default "t"
+    outputgrid : str, optional
+        Either "symetric" or "nonsymetric", default is "nonsymetric"
 
     Returns
     -------
@@ -261,13 +432,21 @@ def grid_from_supergrid(ds, point_type="t"):
     area : xarray.DataArray
         Array of cell areas with dimension (geolat,geolon)
     """
-    geolat = subsample_supergrid(ds, "y", point_type)
-    geolon = subsample_supergrid(ds, "x", point_type)
-    area = sum_on_supergrid(ds, "area", point_type)
+
+    geolat = subsample_supergrid(ds, "y", point_type, outputgrid=outputgrid)
+    geolon = subsample_supergrid(ds, "x", point_type, outputgrid=outputgrid)
+    area = sum_on_supergrid(ds, "area", point_type, outputgrid=outputgrid)
+
     return geolat, geolon, area
 
 
-def horizontal_grid(dictArgs=None, point_type="t", output_type="xarray"):
+def horizontal_grid(
+    dictArgs=None,
+    point_type="t",
+    coords=None,
+    outputgrid="nonsymetric",
+    output_type="xarray",
+):
     """Returns horizontal grid parameters based on the values of the CLI
     arguments and the presence of intake catalogs.
 
@@ -288,6 +467,10 @@ def horizontal_grid(dictArgs=None, point_type="t", output_type="xarray"):
         dictionary of arguments obtained from the CLI parser, by default None
     point_type : str, optional
         Requested grid type of t|q|u|v, by default "t"
+    coords : tuple, optional
+        target xarray coordinates
+    outputgrid : str, optional
+        Either "symetric" or "nonsymetric", default is "nonsymetric"
     output_type : str, optional
         Specify output format of either "xarray" or "numpy", by default "xarray"
 
@@ -318,7 +501,13 @@ def horizontal_grid(dictArgs=None, point_type="t", output_type="xarray"):
         if verbose:
             print("Using optional hgrid file for horizontal grid.")
         ds = xr.open_dataset(dictArgs["hgrid"])
-        geolat, geolon, area = grid_from_supergrid(ds, point_type)
+        geolat, geolon, area = grid_from_supergrid(
+            ds, point_type, outputgrid=outputgrid
+        )
+        wet = infer_wet_mask(dictArgs, coords=coords, point_type=point_type)
+        warnings.warn(
+            "Inferring wet mask from topography. Consider using ocean_static.nc"
+        )
 
     elif dictArgs["static"] is not None:
         if verbose:
@@ -329,16 +518,19 @@ def horizontal_grid(dictArgs=None, point_type="t", output_type="xarray"):
         if point_type == "T":
             geolat = ds["geolat"]
             geolon = ds["geolon"]
+            wet = ds["wet"]
             area = ds["areacello"]
 
         elif point_type == "U":
             geolat = ds["geolat_u"]
             geolon = ds["geolon_u"]
+            wet = ds["wet_u"]
             area = ds["areacello_cu"]
 
         elif point_type == "V":
             geolat = ds["geolat_v"]
             geolon = ds["geolon_v"]
+            wet = ds["wet_v"]
             area = ds["areacello_cv"]
 
         else:
@@ -349,7 +541,13 @@ def horizontal_grid(dictArgs=None, point_type="t", output_type="xarray"):
             print("Using optional gridspec tar file for horizontal grid.")
         tar = tf.open(dictArgs["gridspec"])
         ds = extract_from_tar(tar, "ocean_hgrid.nc")
-        geolat, geolon, area = grid_from_supergrid(ds, point_type)
+        geolat, geolon, area = grid_from_supergrid(
+            ds, point_type, outputgrid=outputgrid
+        )
+        wet = infer_wet_mask(dictArgs, coords=coords, point_type=point_type)
+        warnings.warn(
+            "Inferring wet mask from topography. Consider using ocean_static.nc"
+        )
 
     elif dictArgs["platform"] is not None and dictArgs["config"] is not None:
         if verbose:
@@ -358,12 +556,19 @@ def horizontal_grid(dictArgs=None, point_type="t", output_type="xarray"):
             )
         cat = open_intake_catalog(dictArgs["platform"], dictArgs["config"])
         ds = cat["ocean_hgrid"].to_dask()
-        geolat, geolon, area = grid_from_supergrid(ds, point_type)
+        geolat, geolon, area = grid_from_supergrid(
+            ds, point_type, outputgrid=outputgrid
+        )
+        wet = infer_wet_mask(dictArgs, coords=coords, point_type=point_type)
+        warnings.warn(
+            "Inferring wet mask from topography. Consider using ocean_static.nc"
+        )
 
     result = xr.Dataset()
     result["geolat"] = geolat
     result["geolon"] = geolon
     result["area"] = area
+    result["wet"] = wet
 
     # nominal coordinates
     result["nominal_x"] = result.geolon.max(axis=-2)
@@ -420,7 +625,7 @@ def open_intake_catalog(platform, config):
     return cat
 
 
-def read_topography(dictArgs):
+def read_topography(dictArgs, coords=None, point_type="t"):
     """Returns topography field based on the values of the CLI
     arguments and the presence of intake catalogs.
 
@@ -428,12 +633,18 @@ def read_topography(dictArgs):
     ----------
     dictArgs : dict, optional
         dictionary of arguments obtained from the CLI parser, by default None
+    coords : tuple, optional
+        target xarray coordinates
+    point_type : str, optional
+        Requested grid type of t|q|u|v, by default "t"
 
     Returns
     -------
-    numpy.ma.maskedArray
+    xarray.DataArray
         topography array
     """
+
+    point_type = point_type.upper()
 
     verbose = dictArgs["verbose"] if "verbose" in dictArgs else False
 
@@ -462,10 +673,97 @@ def read_topography(dictArgs):
         ds = cat["topog"].to_dask()
 
     if "deptho" in list(ds.variables):
-        depth = ds.deptho.to_masked_array()
+        depth = ds.deptho
     elif "depth" in list(ds.variables):
-        depth = ds.depth.to_masked_array()
+        depth = ds.depth
 
-    depth = np.where(np.isnan(depth), 0.0, depth)
+    coords = xr.Dataset(coords)
+    xedge = "outer" if (len(coords.xq) == len(coords.xh) + 1) else "right"
+    yedge = "outer" if (len(coords.yq) == len(coords.yh) + 1) else "right"
+    out_grid = Grid(
+        coords,
+        coords={"X": {"center": "xh", xedge: "xq"}, "Y": {"center": "yh", yedge: "yq"}},
+        periodic=["X"],
+    )
+
+    if point_type == "V":
+        depth = out_grid.interp(depth, "Y", boundary="fill")
+    elif point_type == "U":
+        depth = out_grid.interp(depth, "X", boundary="fill")
 
     return depth
+
+
+def infer_wet_mask(dictArgs, coords=None, point_type="t"):
+    """Infers the model's wet mask based on the model topography
+
+    Parameters
+    ----------
+    dictArgs : dict, optional
+        dictionary of arguments obtained from the CLI parser, by default None
+    coords : tuple, optional
+        target xarray coordinates
+    point_type : str, optional
+        Requested grid type of t|q|u|v, by default "t"
+
+    Returns
+    -------
+    xarray.DataArray
+        wet mask of ocean=1, land=0
+    """
+    depth = read_topography(dictArgs, coords=coords, point_type=point_type)
+    depth = xr.where(depth.isnull(), 0.0, depth)
+    return xr.where(depth > 0.0, 1.0, 0.0)
+
+
+def annual_cycle(ds, var):
+    """Compute annual cycle climatology"""
+    # Make a DataArray with the number of days in each month, size = len(time)
+    if hasattr(ds.time, "calendar"):
+        cal = ds.time.calendar
+    elif hasattr(ds.time, "calendar_type"):
+        cal = ds.time.calendar_type.lower()
+    else:
+        cal = "standard"
+
+    if cal.lower() in ["noleap", "365day"]:
+        # always calculate days in month based on year 1 (non-leap year)
+        month_length = [calendar.monthrange(1, x.month)[1] for x in ds.time.to_index()]
+    else:
+        # use real year/month combo to calculate days in month
+        month_length = [
+            calendar.monthrange(x.year, x.month)[1] for x in ds.time.to_index()
+        ]
+
+    month_length = xr.DataArray(month_length, coords=[ds.time], name="month_length")
+
+    # Calculate the weights by grouping by 'time.season'.
+    # Conversion to float type ('astype(float)') only necessary for Python 2.x
+    weights = (
+        month_length.groupby("time.month") / month_length.groupby("time.month").sum()
+    )
+
+    # Test that the sum of the weights for each season is 1.0
+    np.testing.assert_allclose(weights.groupby("time.month").sum().values, np.ones(12))
+
+    # Calculate the weighted average
+    ds_weighted = (ds[var] * weights).groupby("time.month").sum(dim="time")
+
+    return ds_weighted
+
+
+def add_matrix_NaNs(regridder):
+    """Helper function to set masked points to NaN instead of zero"""
+    X = regridder.weights
+    M = scipy.sparse.csr_matrix(X)
+    num_nonzeros = np.diff(M.indptr)
+    M[num_nonzeros == 0, 0] = np.NaN
+    regridder.weights = scipy.sparse.coo_matrix(M)
+    return regridder
+
+
+def curv_to_curv(src, dst, reuse_weights=False):
+    regridder = xe.Regridder(src, dst, "bilinear", reuse_weights=reuse_weights)
+    if version.parse(xe.__version__) < version.parse("0.4.0"):
+        regridder = add_matrix_NaNs(regridder)
+    return regridder(src)
